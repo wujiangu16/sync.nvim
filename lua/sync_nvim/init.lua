@@ -14,9 +14,11 @@ local defaults = {
   remote_home = "~",
   remote_dir = nil,
   hosts = {},
-  timeout = 60,
+  timeout = 0,
   notify = true,
   use_local_config = true,
+  local_config_trust = "prompt",
+  local_config_trust_file = nil,
   local_config_names = { ".sync_nvim.lua", ".sync-nvim.lua" },
 }
 
@@ -24,6 +26,7 @@ local state = {
   config = vim.deepcopy(defaults),
   commands_created = false,
   active_config = nil,
+  trusted_configs = nil,
 }
 
 local function config()
@@ -69,6 +72,107 @@ local function local_config_names(base_config)
   return base_config.local_config_names or {}
 end
 
+local function normalize_path(path)
+  return normalize_dir(path)
+end
+
+local function local_config_trust_file(base_config)
+  if base_config.local_config_trust_file and trim(base_config.local_config_trust_file) ~= "" then
+    return vim.fn.expand(base_config.local_config_trust_file)
+  end
+
+  return vim.fn.stdpath("data") .. "/sync_nvim/trusted_configs"
+end
+
+local function local_config_hash(path)
+  local ok, lines = pcall(vim.fn.readfile, path, "b")
+  if not ok then
+    return nil, lines
+  end
+
+  return vim.fn.sha256(table.concat(lines, "\n"))
+end
+
+local function local_config_trust_key(path)
+  local hash, hash_error = local_config_hash(path)
+  if not hash then
+    return nil, hash_error
+  end
+
+  return hash .. " " .. normalize_path(path)
+end
+
+local function load_trusted_configs(base_config)
+  if state.trusted_configs then
+    return state.trusted_configs
+  end
+
+  local trusted = {}
+  local trust_file = local_config_trust_file(base_config)
+
+  if vim.fn.filereadable(trust_file) == 1 then
+    for _, line in ipairs(vim.fn.readfile(trust_file)) do
+      line = trim(line)
+      if line ~= "" then
+        trusted[line] = true
+      end
+    end
+  end
+
+  state.trusted_configs = trusted
+  return trusted
+end
+
+local function save_trusted_configs(base_config)
+  local trust_file = local_config_trust_file(base_config)
+  local trust_dir = vim.fn.fnamemodify(trust_file, ":h")
+  vim.fn.mkdir(trust_dir, "p")
+
+  local lines = {}
+  for key in pairs(state.trusted_configs or {}) do
+    table.insert(lines, key)
+  end
+  table.sort(lines)
+
+  local ok, result = pcall(vim.fn.writefile, lines, trust_file)
+  if not ok then
+    return false, result
+  end
+
+  if result ~= 0 then
+    return false, "writefile returned " .. tostring(result)
+  end
+
+  return true
+end
+
+local function trust_local_config(path, base_config)
+  local key, key_error = local_config_trust_key(path)
+  if not key then
+    return false, key_error
+  end
+
+  local trusted = load_trusted_configs(base_config)
+  trusted[key] = true
+
+  local ok, write_error = save_trusted_configs(base_config)
+  if not ok then
+    trusted[key] = nil
+    return false, write_error
+  end
+
+  return true
+end
+
+local function local_config_is_trusted(path, base_config)
+  local key = local_config_trust_key(path)
+  if not key then
+    return false
+  end
+
+  return load_trusted_configs(base_config)[key] == true
+end
+
 local function find_local_config(base_config)
   if not base_config.use_local_config then
     return nil
@@ -83,6 +187,50 @@ local function find_local_config(base_config)
   end
 
   return nil
+end
+
+local function should_load_local_config(path, base_config, opts)
+  opts = opts or {}
+  local trust_mode = base_config.local_config_trust or "prompt"
+
+  if trust_mode == true or trust_mode == "always" then
+    return true
+  end
+
+  if trust_mode == false or trust_mode == "never" then
+    notify("Skipped local sync.nvim config: " .. path, vim.log.levels.WARN)
+    return false
+  end
+
+  if local_config_is_trusted(path, base_config) then
+    return true
+  end
+
+  if opts.prompt_for_trust == false then
+    return false
+  end
+
+  local choice = vim.fn.confirm(
+    "Trust sync.nvim local config?\n\n"
+      .. path
+      .. "\n\nThis Lua file can execute code.",
+    "&Trust\n&Skip",
+    2
+  )
+
+  if choice == 1 then
+    local ok, trust_error = trust_local_config(path, base_config)
+    if ok then
+      notify("Trusted local sync.nvim config: " .. path)
+      return true
+    end
+
+    notify("Could not trust local sync.nvim config: " .. tostring(trust_error), vim.log.levels.ERROR)
+    return false
+  end
+
+  notify("Skipped untrusted local sync.nvim config: " .. path, vim.log.levels.WARN)
+  return false
 end
 
 local function load_local_config(path)
@@ -103,11 +251,15 @@ local function load_local_config(path)
   return result, nil
 end
 
-local function resolve_config()
+local function resolve_config(opts)
   local resolved = vim.deepcopy(state.config)
   local path = find_local_config(resolved)
 
   if not path then
+    return resolved
+  end
+
+  if not should_load_local_config(path, resolved, opts) then
     return resolved
   end
 
@@ -128,13 +280,13 @@ local function resolve_config()
   return resolved
 end
 
-local function with_current_config(fn)
+local function with_current_config(fn, opts)
   if state.active_config then
     return fn()
   end
 
   local previous = state.active_config
-  state.active_config = resolve_config()
+  state.active_config = resolve_config(opts)
 
   local results = pack(pcall(fn))
   local ok = results[1]
@@ -224,6 +376,40 @@ local function display_hosts(hosts)
   for i, host in ipairs(hosts) do
     print(i .. ". " .. host.name)
   end
+end
+
+local function choice_token(value)
+  value = trim(value):gsub("%s+", "")
+
+  if value:match("^%d+$") or value:match("^%d+%-%d+$") then
+    return true
+  end
+
+  if not value:find(",", 1, true) then
+    return false
+  end
+
+  for part in value:gmatch("[^,]+") do
+    if not part:match("^%d+$") then
+      return false
+    end
+  end
+
+  return value:sub(1, 1) ~= "," and value:sub(-1) ~= ","
+end
+
+local function parse_command_args(args)
+  args = trim(args)
+  if args == "" then
+    return "", nil
+  end
+
+  local first, rest = args:match("^(%S+)%s*(.*)$")
+  if first and choice_token(first) then
+    return trim(rest), first
+  end
+
+  return args, nil
 end
 
 local function valid_host_index(index, host_count)
@@ -491,30 +677,92 @@ local function build_proxy_command(proxy, destination_host, extra_args)
 end
 
 local function run_shell_command(command)
-  vim.cmd("!" .. command)
+  local ok, command_error = pcall(vim.cmd, "!" .. command)
+  if not ok then
+    notify("Sync command failed: " .. tostring(command_error), vim.log.levels.ERROR)
+    return false, command_error
+  end
+
+  local exit_code = vim.v.shell_error
+  if exit_code ~= 0 then
+    notify("Sync command failed with exit code " .. exit_code, vim.log.levels.ERROR)
+    return false, exit_code
+  end
+
+  return true, 0
+end
+
+local function build_plan_from_selection(hosts, selection, extra_args)
+  local commands = {}
+
+  if selection.mode == "proxy" then
+    local proxy_host = hosts[selection.proxy]
+    local direct_command, direct_source, direct_destination = build_direct_command(proxy_host, extra_args or "")
+    table.insert(commands, {
+      command = direct_command,
+      source = direct_source,
+      destination = direct_destination,
+    })
+
+    local proxy_command, proxy_source, proxy_destination =
+      build_proxy_command(proxy_host, hosts[selection.destination], extra_args or "")
+    table.insert(commands, {
+      command = proxy_command,
+      source = proxy_source,
+      destination = proxy_destination,
+    })
+
+    return commands
+  end
+
+  for _, destination_choice in ipairs(selection.destinations) do
+    local direct_command, direct_source, direct_destination =
+      build_direct_command(hosts[destination_choice], extra_args or "")
+    table.insert(commands, {
+      command = direct_command,
+      source = direct_source,
+      destination = direct_destination,
+    })
+  end
+
+  return commands
+end
+
+local function build_plan_from_choice(hosts, choice, extra_args)
+  local selection, choice_error = parse_choice(choice, #hosts)
+  if choice_error then
+    return nil, choice_error
+  end
+
+  return build_plan_from_selection(hosts, selection, extra_args), nil, selection
+end
+
+local function print_plan(commands)
+  print "sync.nvim dry run:"
+  for index, item in ipairs(commands) do
+    print(index .. ". " .. item.command)
+  end
 end
 
 local function sync_with_choice(hosts, choice, extra_args)
-  local selection, choice_error = parse_choice(choice, #hosts)
+  local commands, choice_error, selection = build_plan_from_choice(hosts, choice, extra_args)
   if choice_error then
     notify(choice_error, vim.log.levels.ERROR)
     return false
   end
 
   if selection.mode == "proxy" then
-    local proxy_host = hosts[selection.proxy]
-    local destination_host = hosts[selection.destination]
-    local direct_command, direct_source, direct_destination = build_direct_command(proxy_host, extra_args)
-
     print "sync with proxy"
 
-    run_shell_command(direct_command)
-    print("sync from " .. direct_source .. " to " .. direct_destination .. " complete.")
+    for _, item in ipairs(commands) do
+      local ok = run_shell_command(item.command)
+      if not ok then
+        print("sync from " .. item.source .. " to " .. item.destination .. " failed.")
+        return false
+      end
 
-    local proxy_command, proxy_source, proxy_destination = build_proxy_command(proxy_host, destination_host, extra_args)
-
-    run_shell_command(proxy_command)
-    print("sync from " .. proxy_source .. " to " .. proxy_destination .. " complete.")
+      print("sync from " .. item.source .. " to " .. item.destination .. " complete.")
+    end
 
     return true
   end
@@ -525,12 +773,14 @@ local function sync_with_choice(hosts, choice, extra_args)
     print "sync directly to dest host"
   end
 
-  for _, destination_choice in ipairs(selection.destinations) do
-    local destination_host = hosts[destination_choice]
-    local direct_command, direct_source, direct_destination = build_direct_command(destination_host, extra_args)
+  for _, item in ipairs(commands) do
+    local ok = run_shell_command(item.command)
+    if not ok then
+      print("sync from " .. item.source .. " to " .. item.destination .. " failed.")
+      return false
+    end
 
-    run_shell_command(direct_command)
-    print("sync from " .. direct_source .. " to " .. direct_destination .. " complete.")
+    print("sync from " .. item.source .. " to " .. item.destination .. " complete.")
   end
 
   return true
@@ -547,6 +797,27 @@ local function sync(extra_args, choice)
 
     choice = choice or vim.fn.input "Enter your choice(dest, dest,dest, or proxy-dest): "
     return sync_with_choice(hosts, choice, extra_args)
+  end)
+end
+
+local function dry_run(extra_args, choice)
+  return with_current_config(function()
+    local hosts = read_hosts()
+    if not hosts then
+      return false
+    end
+
+    display_hosts(hosts)
+
+    choice = choice or vim.fn.input "Enter your choice(dest, dest,dest, or proxy-dest): "
+    local commands, choice_error = build_plan_from_choice(hosts, choice, extra_args)
+    if choice_error then
+      notify(choice_error, vim.log.levels.ERROR)
+      return false
+    end
+
+    print_plan(commands)
+    return true
   end)
 end
 
@@ -570,6 +841,7 @@ end
 
 function M.setup(opts)
   state.config = vim.tbl_deep_extend("force", state.config, opts or {})
+  state.trusted_configs = nil
 
   set_global_sync()
   set_legacy_module()
@@ -582,12 +854,24 @@ function M.setup(opts)
   state.commands_created = true
 
   vim.api.nvim_create_user_command("SyncNvim", function(opts_)
-    M.sync(opts_.args)
+    local extra_args, choice = parse_command_args(opts_.args)
+    M.sync(extra_args, choice)
   end, { nargs = "*" })
 
-  vim.api.nvim_create_user_command("SyncNvimDelete", function()
-    M.sync("--delete")
-  end, {})
+  vim.api.nvim_create_user_command("SyncNvimDelete", function(opts_)
+    local extra_args, choice = parse_command_args(opts_.args)
+    M.sync(shell_join({ "--delete", extra_args }), choice)
+  end, { nargs = "*" })
+
+  vim.api.nvim_create_user_command("SyncNvimDryRun", function(opts_)
+    local extra_args, choice = parse_command_args(opts_.args)
+    M.dry_run(extra_args, choice)
+  end, { nargs = "*" })
+
+  vim.api.nvim_create_user_command("SyncNvimPlan", function(opts_)
+    local extra_args, choice = parse_command_args(opts_.args)
+    M.dry_run(extra_args, choice)
+  end, { nargs = "*" })
 
   vim.api.nvim_create_user_command("SyncNvimHosts", function()
     M.hosts()
@@ -595,6 +879,10 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("SyncNvimConfig", function()
     M.edit_config()
+  end, {})
+
+  vim.api.nvim_create_user_command("SyncNvimTrust", function()
+    M.trust()
   end, {})
 end
 
@@ -607,18 +895,39 @@ function M.hosts()
 
     display_hosts(hosts)
     return true
-  end)
+  end, { prompt_for_trust = false })
 end
 
 function M.edit_config()
   return with_current_config(function()
     edit_config()
     return true
-  end)
+  end, { prompt_for_trust = false })
 end
 
 function M.sync(extra_args, choice)
   return sync(extra_args or "", choice)
+end
+
+function M.dry_run(extra_args, choice)
+  return dry_run(extra_args or "", choice)
+end
+
+function M.trust()
+  local path = find_local_config(state.config)
+  if not path then
+    notify "No local sync.nvim config found in the current directory."
+    return false
+  end
+
+  local ok, trust_error = trust_local_config(path, state.config)
+  if not ok then
+    notify("Could not trust local sync.nvim config: " .. tostring(trust_error), vim.log.levels.ERROR)
+    return false
+  end
+
+  notify("Trusted local sync.nvim config: " .. path)
+  return true
 end
 
 function M.read_hosts()
@@ -632,41 +941,9 @@ function M.build_plan(choice, extra_args)
       return nil
     end
 
-    local selection, choice_error = parse_choice(choice, #hosts)
+    local commands, choice_error = build_plan_from_choice(hosts, choice, extra_args or "")
     if choice_error then
       return nil, choice_error
-    end
-
-    local commands = {}
-
-    if selection.mode == "proxy" then
-      local proxy_host = hosts[selection.proxy]
-      local direct_command, direct_source, direct_destination = build_direct_command(proxy_host, extra_args or "")
-      table.insert(commands, {
-        command = direct_command,
-        source = direct_source,
-        destination = direct_destination,
-      })
-
-      local proxy_command, proxy_source, proxy_destination =
-        build_proxy_command(proxy_host, hosts[selection.destination], extra_args or "")
-      table.insert(commands, {
-        command = proxy_command,
-        source = proxy_source,
-        destination = proxy_destination,
-      })
-
-      return commands
-    end
-
-    for _, destination_choice in ipairs(selection.destinations) do
-      local direct_command, direct_source, direct_destination =
-        build_direct_command(hosts[destination_choice], extra_args or "")
-      table.insert(commands, {
-        command = direct_command,
-        source = direct_source,
-        destination = direct_destination,
-      })
     end
 
     return commands

@@ -21,6 +21,8 @@ It does not use Git and no longer needs `~/.config/sync/.config`.
 - Support proxy sync with `proxy-dest`.
 - Use built-in default exclude patterns.
 - Support per-folder `.sync_nvim.lua` overrides when needed.
+- Ask before loading a new local Lua config file.
+- Support dry-run command previews.
 
 ## Remote Path
 
@@ -66,8 +68,11 @@ With lazy.nvim:
 | --- | --- |
 | `:SyncNvim` | Prompt for a host choice and rsync the current folder. |
 | `:SyncNvimDelete` | Same as `:SyncNvim`, but adds `--delete`. |
+| `:SyncNvimDryRun` | Print the commands that would run without syncing. |
+| `:SyncNvimPlan` | Alias for `:SyncNvimDryRun`. |
 | `:SyncNvimHosts` | Print SSH config hosts. |
 | `:SyncNvimConfig` | Open `~/.ssh/config`. |
+| `:SyncNvimTrust` | Trust the local `.sync_nvim.lua` in the current folder. |
 
 ## Usage
 
@@ -92,7 +97,21 @@ Enter your choice(dest, dest,dest, or proxy-dest): 2
 This runs the equivalent of:
 
 ```sh
-rsync -av --exclude='*.swp' --exclude='*.swo' --exclude='*.swx' --exclude='*__pycache__' ~/code/my_project/ remote-host:~/code/my_project/ --timeout=60
+rsync -av --exclude='*.swp' --exclude='*.swo' --exclude='*.swx' --exclude='*__pycache__' ~/code/my_project/ remote-host:~/code/my_project/
+```
+
+You can also pass the host choice directly:
+
+```vim
+:SyncNvim 2
+:SyncNvim 2,5
+:SyncNvim 2-5
+```
+
+Preview the commands without running them:
+
+```vim
+:SyncNvimDryRun 2-5
 ```
 
 Sync local to multiple hosts:
@@ -130,14 +149,17 @@ require("sync_nvim").setup({
   remote_home = "~",
   remote_dir = nil,
   hosts = {},
-  timeout = 60,
+  timeout = 0,
   notify = true,
   use_local_config = true,
+  local_config_trust = "prompt",
+  local_config_trust_file = nil,
   local_config_names = { ".sync_nvim.lua", ".sync-nvim.lua" },
 })
 ```
 
-Set `timeout = 0` to omit rsync's `--timeout` option entirely.
+`timeout = 0` omits rsync's `--timeout` option entirely. Set a positive
+number to add `--timeout=<seconds>`.
 
 ## Per-Folder Overrides
 
@@ -183,3 +205,23 @@ apply first, then the matching host settings override them.
 
 If `.sync_nvim.lua` exists in the current working directory, it is merged into
 the global config for that command. If it does not exist, defaults are used.
+
+Because `.sync_nvim.lua` is a Lua file, it can execute code. By default,
+`sync.nvim` asks before loading a new local config and stores trust by file
+path plus file content hash. If the file changes, you will be asked again.
+
+You can skip the prompt for your own machines:
+
+```lua
+require("sync_nvim").setup({
+  local_config_trust = "always",
+})
+```
+
+Or disable local configs entirely:
+
+```lua
+require("sync_nvim").setup({
+  use_local_config = false,
+})
+```
