@@ -1,7 +1,7 @@
 ---@type LazySpec
 return {
   {
-    dir = vim.fn.expand("~/code/sync_nvim"),
+    "wujiangu16/sync.nvim",
     name = "sync_nvim",
     lazy = false,
     opts = {},

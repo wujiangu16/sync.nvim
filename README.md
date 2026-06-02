@@ -49,11 +49,11 @@ You can override them in a local `.sync_nvim.lua`.
 
 ## Installation
 
-For local development with lazy.nvim:
+With lazy.nvim:
 
 ```lua
 {
-  dir = vim.fn.expand("~/code/sync_nvim"),
+  "wujiangu16/sync.nvim",
   name = "sync_nvim",
   lazy = false,
   opts = {},
